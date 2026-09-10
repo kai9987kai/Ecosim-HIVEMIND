@@ -1,0 +1,20 @@
+{
+  "name": "ecosim-hivemind",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A reproducible ecosystem and collective-behavior simulation laboratory.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node --test",
+    "check": "node scripts/check.js",
+    "test:browser": "node scripts/browser-smoke.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "playwright": "1.60.0"
+  }
+}
