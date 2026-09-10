@@ -2,7 +2,6 @@
 
 A local ecosystem simulation lab for watching collective foraging, inherited variation, and predator–prey dynamics. Explore a seeded world, inspect individual organisms, change its conditions, and compare shared signals against an independent baseline.
 
-This branch contains a separate, newly built laboratory. The original [EcoSim v7 on `main`](https://github.com/kai9987kai/Ecosim-HIVEMIND/tree/main) remains available. This implementation adds deterministic snapshots and paired experiments, but does not reproduce v7's neural policies, quality-diversity archive, obstacles, or nutrient cycling.
 
 The browser interface includes a responsive landscape, resource and signal overlays, population histories, a keyboard-accessible organism inspector, and a research notebook. The underlying model is deliberately small and explicit: its measurements describe programmed agents, not real species or learned intelligence.
 
