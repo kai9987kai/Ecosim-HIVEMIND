@@ -1,0 +1,173 @@
+import { chromium } from 'playwright';
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { Simulation } from '../src/simulation.js';
+
+const output = resolve('output/playwright');
+await mkdir(output, { recursive: true });
+const server = spawn(process.execPath, ['server.js'], { env: { ...process.env, PORT: '4174' }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+let browser;
+let serverError = '';
+server.stderr.on('data', chunk => { serverError += chunk; });
+const errors = [];
+const checks = [];
+const check = (description, value) => { assert.ok(value, description); checks.push(description); console.log(`PASS ${description}`); };
+try {
+  await new Promise((resolveReady, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Server startup timed out. ${serverError}`)), 15000);
+    server.stdout.once('data', () => { clearTimeout(timer); resolveReady(); });
+    server.once('exit', code => { clearTimeout(timer); reject(new Error(`Server exited ${code}. ${serverError}`)); });
+    server.once('error', reject);
+  });
+  browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1440, height: 1080 }, acceptDownloads: true });
+  const page = await context.newPage();
+  page.on('pageerror', error => errors.push(error.message));
+  page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
+  await page.goto('http://127.0.0.1:4174', { waitUntil: 'networkidle' });
+  await page.waitForFunction(() => typeof window.render_game_to_text === 'function');
+  await page.evaluate(() => window.advanceTime(0));
+  const readState = () => page.evaluate(() => JSON.parse(window.render_game_to_text()));
+  const pause = async () => { if ((await readState()).playing) await page.locator('#play-button').click(); };
+  await pause();
+  let current = await readState();
+  check('Initial habitat contains real agents and resource patches', current.metrics.population > 80 && current.metrics.plants > 100);
+  await page.screenshot({ path: `${output}/habitat-desktop.png`, fullPage: true });
+  const tick = current.metrics.tick;
+  await page.evaluate(() => window.advanceTime(1000));
+  check('Pause holds logical time', (await readState()).metrics.tick === tick);
+  await page.locator('#step-button').click();
+  check('Step advances exactly one tick and remains paused', (await readState()).metrics.tick === tick + 1 && !(await readState()).playing);
+  await page.locator('[data-speed="4"]').click();
+  await page.locator('#play-button').click();
+  await page.evaluate(() => window.advanceTime(1000));
+  check('4x playback advances 120 fixed ticks per simulated second', (await readState()).metrics.tick === tick + 121);
+  await pause();
+  await page.locator('[data-speed="1"]').click();
+
+  current = await readState();
+  const agent = current.agents.find(item => item.x > 230 && item.x < 730 && item.y > 180 && item.y < 480) || current.agents[0];
+  const box = await page.locator('#world-canvas').boundingBox();
+  await page.mouse.click(box.x + agent.x / 1000 * box.width, box.y + agent.y / 680 * box.height);
+  check('Canvas picking selects a living organism', (await readState()).selected !== null);
+  await page.locator('#organism-select').selectOption(String(current.agents[1].id));
+  check('Keyboard-accessible organism selector updates inspector', (await readState()).selectedId === current.agents[1].id);
+  await page.locator('[data-layer="signals"]').click();
+  check('Signal overlay displays a populated model field', (await readState()).layer === 'signals' && (await readState()).fieldMaximum > 0);
+  await page.screenshot({ path: `${output}/signals-desktop.png`, fullPage: true });
+  await page.locator('[data-layer="resources"]').click();
+  check('Resource overlay is selectable', (await readState()).layer === 'resources');
+  await page.locator('[data-layer="organisms"]').click();
+
+  for (const [selector, key] of [['#resource-rate', 'resourceRate'], ['#seasonality', 'seasonality'], ['#cooperation', 'cooperation'], ['#mutation-rate', 'mutationRate']]) {
+    const before = (await readState()).config[key];
+    await page.locator(selector).focus();
+    await page.keyboard.press('ArrowRight');
+    check(`${key} keyboard adjustment reaches simulation config`, (await readState()).config[key] > before);
+  }
+  for (const type of ['rain', 'bloom', 'drought', 'predators']) {
+    const before = (await readState()).metrics.predators;
+    await page.locator(`[data-intervention="${type}"]`).click();
+    check(`${type} intervention records its effect`, (await readState()).latestEvent.type === type);
+    if (type === 'predators') check('Predator intervention adds four agents', (await readState()).metrics.predators === before + 4);
+  }
+  await page.locator('#event-log-button').click();
+  check('Field log displays model events', await page.locator('#event-list li').count() >= 4);
+  await page.keyboard.press('Escape');
+
+  const saved = await readState();
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#save-button').click();
+  const download = await downloadPromise;
+  const snapshotPath = `${output}/world-roundtrip.json`;
+  await download.saveAs(snapshotPath);
+  const snapshot = JSON.parse(await readFile(snapshotPath, 'utf8'));
+  check('Downloaded snapshot validates and matches visible state', Simulation.fromSnapshot(snapshot).tick === saved.metrics.tick);
+  await page.locator('#preset-select').selectOption('dunes');
+  check('Changing preset creates a fresh habitat', (await readState()).config.preset === 'dunes' && (await readState()).metrics.tick === 0);
+  await page.locator('#snapshot-file').setInputFiles(snapshotPath);
+  await page.waitForFunction(seed => JSON.parse(window.render_game_to_text()).config.seed === seed && !JSON.parse(window.render_game_to_text()).playing, snapshot.config.seed);
+  assert.deepEqual((await readState()).metrics, saved.metrics);
+  check('Snapshot restores exact metrics and pauses playback', !(await readState()).playing);
+  const reSave = page.waitForEvent('download');
+  await page.locator('#save-button').click();
+  await (await reSave).saveAs(`${output}/world-restored.json`);
+  assert.deepEqual(JSON.parse(await readFile(`${output}/world-restored.json`, 'utf8')), snapshot);
+  check('Browser snapshot round trip preserves complete engine state', true);
+  await page.locator('#snapshot-file').setInputFiles({ name: 'invalid.json', mimeType: 'application/json', buffer: Buffer.from('{"schemaVersion":1,"agents":[]}') });
+  await page.waitForFunction(() => document.getElementById('toast').textContent.startsWith('Could not load world:'));
+  assert.deepEqual((await readState()).metrics, saved.metrics);
+  check('Invalid snapshot leaves the current world intact', true);
+
+  await page.locator('#new-world-button').click();
+  await page.locator('#new-seed').fill('BROWSER-REPLAY');
+  await page.locator('#new-preset').selectOption('wetlands');
+  await page.locator('#new-world-form button[type="submit"]').click();
+  await pause();
+  check('New world applies chosen habitat and seed', (await readState()).config.seed === 'BROWSER-REPLAY' && (await readState()).config.preset === 'wetlands');
+  await page.locator('#reset-button').click();
+  await pause();
+  check('Reset preserves current seed and returns to tick zero', (await readState()).config.seed === 'BROWSER-REPLAY' && (await readState()).metrics.tick === 0);
+  await page.locator('#world-canvas').focus();
+  await page.keyboard.press('Space');
+  check('Space shortcut resumes the habitat', (await readState()).playing);
+  await page.keyboard.press('Space');
+  await page.locator('#fullscreen-button').click();
+  await page.waitForFunction(() => Boolean(document.fullscreenElement));
+  check('Fullscreen opens the habitat panel', await page.evaluate(() => Boolean(document.fullscreenElement)));
+  await page.evaluate(() => document.exitFullscreen());
+
+  await page.locator('[data-view="research"]').click();
+  check('Research notebook provides six linked sources', await page.locator('.research-card a').count() === 6 && await page.locator('#research-view').isVisible());
+  await page.screenshot({ path: `${output}/research-desktop.png`, fullPage: true });
+  await page.locator('[data-view="habitat"]').click();
+  await page.locator('#preset-select').selectOption('meadow');
+  await page.locator('[data-view="experiments"]').click();
+  await page.locator('#replicate-count').selectOption('12');
+  await page.locator('#experiment-ticks').selectOption('3000');
+  await page.locator('#run-experiment').click();
+  await page.locator('#cancel-experiment').click();
+  await page.waitForFunction(() => !JSON.parse(window.render_game_to_text()).experimentRunning);
+  check('Background experiment cancellation returns controls', await page.locator('#run-experiment').isVisible());
+  await page.locator('#replicate-count').selectOption('4');
+  await page.locator('#experiment-ticks').selectOption('600');
+  await page.locator('#run-experiment').click();
+  await page.waitForFunction(() => JSON.parse(window.render_game_to_text()).experimentResult?.rows === 4, undefined, { timeout: 120000 });
+  current = await readState();
+  check('Paired experiment produces four complete measured results', current.experimentResult.rows === 4 && current.experimentResult.ticks === 600);
+  check('Experiment leaves interactive world paused at its original tick', current.metrics.tick === 0 && !current.playing);
+  const resultDownload = page.waitForEvent('download');
+  await page.locator('#export-experiment').click();
+  await (await resultDownload).saveAs(`${output}/experiment-results.json`);
+  const result = JSON.parse(await readFile(`${output}/experiment-results.json`, 'utf8'));
+  check('Experiment export retains actual endpoints and protocol', result.rows.length === 4 && result.rows.every(row => row.delta.foragers === row.shared.foragers - row.baseline.foragers) && result.config.seed === current.config.seed);
+  await page.screenshot({ path: `${output}/experiments-desktop.png`, fullPage: true });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('[data-view="habitat"]').click();
+  await page.waitForFunction(() => document.getElementById('toast').hidden);
+  check('Mobile habitat has no horizontal overflow', await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await page.screenshot({ path: `${output}/habitat-mobile.png`, fullPage: true });
+  await page.locator('[data-view="experiments"]').click();
+  check('Mobile experiment results have no page overflow', await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await page.screenshot({ path: `${output}/experiments-mobile.png`, fullPage: true });
+  const reduced = await browser.newContext({ viewport: { width: 1024, height: 768 }, reducedMotion: 'reduce' });
+  const reducedPage = await reduced.newPage();
+  await reducedPage.goto('http://127.0.0.1:4174');
+  await reducedPage.waitForFunction(() => typeof window.render_game_to_text === 'function');
+  check('Reduced-motion preference starts paused', !(await reducedPage.evaluate(() => JSON.parse(window.render_game_to_text()).playing)));
+  await reduced.close();
+  check('Server refuses access to Git internals', (await fetch('http://127.0.0.1:4174/.git/config')).status === 404);
+  check('Server does not accept uploads', (await fetch('http://127.0.0.1:4174/', { method: 'POST' })).status === 405);
+  check('Browser reports no JavaScript or console errors', errors.length === 0);
+  await writeFile(`${output}/smoke-results.json`, JSON.stringify({ checkedAt: new Date().toISOString(), checks, errors, experiment: { rows: result.rows.length, summary: result.summary } }, null, 2));
+  console.log(`Browser smoke passed: ${checks.length} checks. Screenshots: ${output}`);
+} catch (error) {
+  await writeFile(`${output}/smoke-failure.json`, JSON.stringify({ message: error.message, stack: error.stack, checks, errors }, null, 2));
+  throw error;
+} finally {
+  await browser?.close();
+  server.kill();
+}
